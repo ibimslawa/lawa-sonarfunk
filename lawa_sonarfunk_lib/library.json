@@ -1,0 +1,15 @@
+{
+    "name": "LAWA Sonar+Funk R1 Project Lib",
+    "version": "1.5.0",
+    "description": "Shared code for the LAWA Sonar+Funk R1 project",
+    "authors":
+    [
+      {
+        "name": "Lars Warich"
+      }
+    ],
+    "dependencies": {
+    },
+    "frameworks": "arduino",
+    "platforms": "platformio/espressif32"
+  }
