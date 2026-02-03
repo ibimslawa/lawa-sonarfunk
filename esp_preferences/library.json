@@ -1,0 +1,16 @@
+{
+  "name": "esp_preferences",
+  "version": "1.0.0",
+  "description": "Ported Preferences library from ESP32 Arduino framework top ESP IDF",
+  "authors": [
+    {
+      "name": "Arduino"
+    },
+    {
+      "name": "Lars Warich"
+    }
+  ],
+  "dependencies": {},
+  "frameworks": "espidf",
+  "platforms": "platformio/espressif32"
+}

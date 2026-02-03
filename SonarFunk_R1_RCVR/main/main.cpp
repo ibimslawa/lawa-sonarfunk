@@ -6,16 +6,20 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <driver/gpio.h>
 #include <esp_now.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
+#include <inttypes.h>
+#include <stdlib.h>
+#include <string>
 
+#include "esp_dmx.h"
 #include "lawa_sonarfunk_lib.h"
 #include "rcvr_display.h"
 #include "rcvr_types.h"
-#include <esp_dmx.h>
 
-#define FIRMWARE_VER (String) "25-08b"
+#define FIRMWARE_VER (const char *)"26-01a"
 
 // #define DEBUG
 // #define DEBUG_WIREL
@@ -61,16 +65,30 @@ static uint16_t wait_after_setup = 5000;
 #pragma region "DEFINES PINS + DMX + MIDI"
 
 enum MENUBTN_ID : uint8_t {
-  MENU_DN = 0, /* Taster "runter" */
-  MENU_UP = 1, /* Taster "hoch" */
-  MENU_OK = 2, /* Taster "OK" */
-  MENUBTN__CNT = 3
+    MENU_DN = 0, /* Taster "runter" */
+    MENU_UP = 1, /* Taster "hoch" */
+    MENU_OK = 2, /* Taster "OK" */
+    MENUBTN__COUNT = 3
 };
 struct menubtn_t {
-  const unsigned short bit;
-  const uint8_t pin;
+    const unsigned short bit;
+    const uint8_t pin;
 };
+enum MENUBTN_STATE : uint8_t {
+    MENUBTN_STATE_NONE = 0,
+    MENUBTN_STATE_DOWN = 1,
+    MENUBTN_STATE_PRESSED = 2,
+    MENUBTN_STATE_HOLD = 3
+}
+
 static const menubtn_t IN_MENUBTNS[] = {{MENU_DN, 35}, {MENU_UP, 34}, {MENU_OK, 39}};
+static const gpio_config_t IN_MENUBTNS_GPIO_CFG = {
+    .pin_bit_mask =
+        ((1ULL << IN_MENUBTNS[MENU_DN].pin) | (1ULL << IN_MENUBTNS[MENU_UP].pin) | (1ULL << IN_MENUBTNS[MENU_OK].pin)),
+    .mode = GPIO_MODE_INPUT,
+    .pull_up_en = GPIO_PULLUP_DISABLE,
+    .pull_down_en = GPIO_PULLDOWN_ENABLE,
+    .intr_type = GPIO_INTR_DISABLE};
 #define OUT_LED_ACTY 2  /* LED Aktivity IO2=LED_BUILTIN */
 #define OUT_LED_ERROR 4 /* LED Error */
 #define OUT_DMX_TX 17   /* DMX TX UART2 */
@@ -117,7 +135,9 @@ static menuvar_t rssiValPeer_perc;
 /* Signalstaerke des Peers. */
 static RssiValue<menuvar_t> rssiPeer = RssiValue<menuvar_t>(0, &rssiValPeer_perc, RSSI_NO_CONN, -50);
 /* Speichert ob ein Taster betaetigt ist. */
-static uint8_t menubtnsPressed = 0b0000;
+// static uint8_t menubtnsPressed = 0b0000;
+/* Menuetaster Aktion */
+static MENUBTN_STATE menubtn_states[MENUBTN__COUNT] = {MENUBTN_STATE_NONE, MENUBTN_STATE_NONE, MENUBTN_STATE_NONE};
 /* Speichert die Funktionskanaele. */
 static uint8_t fun_channels[DMX_PERS_MAXCH] = {0};
 /* Anzahl der aktuell verwendeteten Funktions-Taster (Modus). */
@@ -185,276 +205,309 @@ DispSlx2016_4d Disp1 = DispSlx2016_4d(&disp_menus, MENU_COUNT, &OUT_DISP);
 void sendDmxData();
 void setErrorcodeBit(SOFU_ERRORCODE_BIT fc_bit, bool set);
 void resetDispTimestamps();
-void OnMenuBtnPress(uint8_t menubtnsPressed, uint8_t bitBtn);
-void OnMenuBtnPressLong(uint8_t menubtnsPressed, uint8_t bitBtn);
-void OnMenuBtnHold(uint8_t menubtnsPressed, uint8_t bitBtn);
-void OnDataRecv_Rcvr(const uint8_t *mac, const uint8_t *in_data, int data_len);
-void OnPromiscuousRxEspnow_Rcvr(void *buf, wifi_promiscuous_pkt_type_t type);
-bool OnSaveUserSetting_Disp(rcvr_disp_menue_t currMenu);
+void MenuBtnPress(uint8_t menubtnsPressed, uint8_t ixBtn);
+void MenuBtnHold(uint8_t menubtnsPressed, uint8_t ixBtn);
+void DataRecv_Rcvr(const uint8_t *mac, const uint8_t *in_data, int data_len);
+void PromiscuousRxEspnow_Rcvr(void *buf, wifi_promiscuous_pkt_type_t type);
+bool SaveUserSetting_Disp(rcvr_disp_menue_t currMenu);
+
+void ARDUINO_ISR_ATTR OnMenuBtnChange();
 
 #pragma endregion
 
 #pragma region "INITIALISATION FUNCTIONS"
 
 void initEspNow_Rcvr() {
-  Serial.print("[INFO] ESP-NOW init...");
-  if ( esp_now_init() != ESP_OK ) {
-    Serial.println("[ERROR] Could not initialise ESP-NOW.");
-    setErrorcodeBit(ERRBIT_ENOW, true);
-  } else {
-    // Register peer
-    esp_now_peer_info_t peerInfo = {.channel = 0, .ifidx = WIFI_IF_STA, .encrypt = false};
-    memcpy(peerInfo.peer_addr, MAC_PEER, 6);
-    // Add peer
-    if ( esp_now_add_peer(&peerInfo) != ESP_OK ) {
-      Serial.println("[ERROR] Cannot add peer connection.");
-      setErrorcodeBit(ERRBIT_ENOW, true);
+    Serial.print("[INFO] ESP-NOW init...");
+    if ( esp_now_init() != ESP_OK ) {
+        Serial.println("[ERROR] Could not initialise ESP-NOW.");
+        setErrorcodeBit(ERRBIT_ENOW, true);
+    } else {
+        // Register peer
+        esp_now_peer_info_t peerInfo = {.channel = 0, .ifidx = WIFI_IF_STA, .encrypt = false};
+        memcpy(peerInfo.peer_addr, MAC_PEER, 6);
+        // Add peer
+        if ( esp_now_add_peer(&peerInfo) != ESP_OK ) {
+            Serial.println("[ERROR] Cannot add peer connection.");
+            setErrorcodeBit(ERRBIT_ENOW, true);
+        }
+        // Register callback function for ESP-NOW receiver
+        esp_now_register_recv_cb(esp_now_recv_cb_t(DataRecv_Rcvr));
     }
-    // Register callback function for ESP-NOW receiver
-    esp_now_register_recv_cb(esp_now_recv_cb_t(OnDataRecv_Rcvr));
-  }
-  // Register callback function for signal strength reading
-  esp_wifi_set_promiscuous(true);
-  esp_wifi_set_promiscuous_rx_cb(OnPromiscuousRxEspnow_Rcvr);
-  Serial.println(" OK.");
+    // Register callback function for signal strength reading
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_promiscuous_rx_cb(PromiscuousRxEspnow_Rcvr);
+    Serial.println(" OK.");
 }
 
 void initDmxDriver_Rcvr() {
-  Serial.print("[INFO] DMX driver init...");
-  // install the DMX driver...
-  if ( !dmx_driver_install(DMXDRVR_PORT, &DMXDRVR_CONFIG, DMX_PERSIES, DMX_PERS_COUNT) ) {
-    Serial.println("[ERROR] DMX init: Error while installing DMX driver.");
-    setErrorcodeBit(ERRBIT_DMX, true);
-  } else {
-    /* set custom communication pins: */
-    dmx_set_pin(DMXDRVR_PORT, OUT_DMX_TX, OUT_DMX_RX, OUT_DMX_RTS);
-    dmx_set_start_address(DMXDRVR_PORT, dmxdrvr_address);
-  }
-  Serial.println(" OK.");
+    Serial.print("[INFO] DMX driver init...");
+    // install the DMX driver...
+    if ( !dmx_driver_install(DMXDRVR_PORT, &DMXDRVR_CONFIG, DMX_PERSIES, DMX_PERS_COUNT) ) {
+        Serial.println("[ERROR] DMX init: Error while installing DMX driver.");
+        setErrorcodeBit(ERRBIT_DMX, true);
+    } else {
+        /* set custom communication pins: */
+        dmx_set_pin(DMXDRVR_PORT, OUT_DMX_TX, OUT_DMX_RX, OUT_DMX_RTS);
+        dmx_set_start_address(DMXDRVR_PORT, dmxdrvr_address);
+    }
+    Serial.println(" OK.");
 }
 
 void loadPrefs_Rcvr() {
-  if ( preferences.begin(PREFS, false) ) {
-    if ( digitalRead(IN_MENUBTNS[MENU_DN].pin) == HIGH && digitalRead(IN_MENUBTNS[MENU_UP].pin) == HIGH ) {
-      /* Up+Down: Reset preferences */
-      Disp1.writeChars("00 !");
-      delay(1200);
-      if ( preferences.clear() ) Disp1.writeChars(" OK ");
+    if ( preferences.begin(PREFS, false) ) {
+        if ( digitalRead(IN_MENUBTNS[MENU_DN].pin) == HIGH && digitalRead(IN_MENUBTNS[MENU_UP].pin) == HIGH ) {
+            /* Up+Down: Reset preferences */
+            Disp1.writeChars("00 !");
+            delay(1200);
+            if ( preferences.clear() ) Disp1.writeChars(" OK ");
+        }
+
+        dmxdrvr_address = preferences.getShort(PREFS_DMX_ADRS, 401);
+        dmxdrvr_pers.chooseByNum(preferences.getShort(PREFS_PERS_NUM, 1));
+        dmxdrvr_pers_num = dmxdrvr_pers.num();
+        DISPMENU_ADRS->varMax = (513 - dmxdrvr_pers.footpr());
+
+        midi_channel = preferences.getShort(PREFS_MIDI_CHAN, 16);
+        midi_firstNoteNo = preferences.getShort(PREFS_MIDI_NOTE, 120U);
+
+        preferences.end();
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    Serial.println("\nLAWA SONAR+FUNK R1 - RECEIVER starting");
+    Serial.println("Firmware Ver " + String(FIRMWARE_VER) + "\n");
+
+    /* PWM initialisieren */
+    ledcSetup(PWMCH_LED_ACTY, PWMFREQ_LED, PWMRES_LED);
+    ledcSetup(PWMCH_LED_ERR, PWMFREQ_LED, PWMRES_LED);
+    /* Pins initialisieren: */
+    ledcAttachPin(OUT_LED_ACTY, PWMCH_LED_ACTY);
+    ledcAttachPin(OUT_LED_ERROR, PWMCH_LED_ERR);
+    // gpio_config(IN_MENUBTNS_GPIO_CFG);
+    gpio_config_t mneubtns_cfg = {
+        .pin_bit_mask =
+            ((1ULL << IN_MENUBTNS[MENU_DN].pin) | (1ULL << IN_MENUBTNS[MENU_UP].pin) |
+             (1ULL << IN_MENUBTNS[MENU_OK].pin)),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_DISABLE};
+    gpio_config(&mneubtns_cfg);
+
+    /* LED Test Start: */
+    ledcWrite(PWMCH_LED_ACTY, PWM_BRT);
+    ledcWrite(PWMCH_LED_ERR, PWM_BRT);
+
+    /* Display initialisation: */
+    Disp1.init();
+    Disp1.OnSaveUserSetting = &SaveUserSetting_Disp;
+
+    /* ELoad preferences: */
+    loadPrefs_Rcvr();
+
+    /* WIFI initialisation: */
+    Serial.println("[INFO] Initialising Wi-Fi... (Ignore error 0x300a WIFI_IF_STA not found)");
+    WiFi.mode(WIFI_STA);
+    WiFi.begin();
+    Serial.println(" OK.");
+    /* Override MAC address: */
+    esp_err_t err = esp_wifi_set_mac(WIFI_IF_STA, MAC_ME);
+    if ( err == ESP_OK ) {
+        static char macStr[MAC_STR_LEN];
+        getMacAddrStr_esp(macStr);
+        Serial.print("[ OK ] Changed MAC. MAC: " + String(macStr) + "\n");
     }
 
-    dmxdrvr_address = preferences.getShort(PREFS_DMX_ADRS, 401);
-    dmxdrvr_pers.chooseByNum(preferences.getShort(PREFS_PERS_NUM, 1));
-    dmxdrvr_pers_num = dmxdrvr_pers.num();
-    DISPMENU_ADRS->varMax = (513 - dmxdrvr_pers.footpr());
+    /* ESP-NOW initialisation: */
+    initEspNow_Rcvr();
 
-    midi_channel = preferences.getShort(PREFS_MIDI_CHAN, 16);
-    midi_firstNoteNo = preferences.getShort(PREFS_MIDI_NOTE, 120U);
+    /* DMX driver initialisation: */
+    initDmxDriver_Rcvr();
 
-    preferences.end();
-  }
-}
+    /* MIDI Out initialisation: */
+    Serial.print("[INFO] MIDI initialisation...");
+    MidiSerial.begin(31250, SERIAL_8N1, OUT_MIDI_RX, OUT_MIDI_TX);
+    if ( !MidiSerial ) {
+        Serial.println("[ERROR] Could not open MIDI UART.");
+        setErrorcodeBit(ERRBIT_MIDI, true);
+    } else
+        Serial.println(" OK.");
+
+    delay(500);
+    /* LED & Display Test: */
+    char *welcome = SCROLLTEXT_MODELNAME;
+    Disp1.setScrolltext(welcome, true);
+    while ( Disp1.shiftTextByOne() )
+        delay(120);
+    Disp1.clear();
+
+    Serial.println("[INFO] Initialisations finished.\n");
+    delay(500);
+    /* LED Test off: */
+    ledcWrite(PWMCH_LED_ACTY, 0x0);
+    ledcWrite(PWMCH_LED_ERR, 0x0);
+    
+    for ( menubtn_t btn : IN_MENUBTNS ) {
+      attachInterrupt(btn.pin, OnMenuBtnChange, CHANGE);
+    }
+
+    /* Write initial DMX packet */
+    for ( short b = 1; b <= 512; b++ )
+        dmx_write_slot(DMXDRVR_PORT, b, 0x00);
+
+    resetDispTimestamps();
+    wait_after_setup += millis();
+} /* setup */
 
 #pragma endregion
 
 #pragma region "MAIN FUNCTIONS"
 
-void setup() {
-  Serial.begin(115200);
-  Serial.println("\nLAWA SONAR+FUNK R1 - RECEIVER starting");
-  Serial.println("Firmware Ver " + FIRMWARE_VER + "\n");
-
-  /* PWM initialisieren */
-  ledcSetup(PWMCH_LED_ACTY, PWMFREQ_LED, PWMRES_LED);
-  ledcSetup(PWMCH_LED_ERR, PWMFREQ_LED, PWMRES_LED);
-  /* Pins initialisieren: */
-  ledcAttachPin(OUT_LED_ACTY, PWMCH_LED_ACTY);
-  ledcAttachPin(OUT_LED_ERROR, PWMCH_LED_ERR);
-  pinMode(IN_MENUBTNS[MENU_DN].pin, INPUT);
-  pinMode(IN_MENUBTNS[MENU_UP].pin, INPUT);
-  pinMode(IN_MENUBTNS[MENU_OK].pin, INPUT);
-
-  /* LED Test Start: */
-  ledcWrite(PWMCH_LED_ACTY, PWM_BRT);
-  ledcWrite(PWMCH_LED_ERR, PWM_BRT);
-
-  /* Display initialisation: */
-  Disp1.init();
-  Disp1.OnSaveUserSetting = &OnSaveUserSetting_Disp;
-
-  /* ELoad preferences: */
-  loadPrefs_Rcvr();
-
-  /* WIFI initialisation: */
-  Serial.println("[INFO] Initialising Wi-Fi... (Ignore error 0x300a WIFI_IF_STA not found)");
-  WiFi.mode(WIFI_STA);
-  WiFi.begin();
-  Serial.println(" OK.");
-  /* Override MAC address: */
-  esp_err_t err = esp_wifi_set_mac(WIFI_IF_STA, MAC_ME);
-  if ( err == ESP_OK ) {
-    Serial.print("[ OK ] Changed MAC. MAC: " + getMacAddrStr_esp());
-  }
-
-  /* ESP-NOW initialisation: */
-  initEspNow_Rcvr();
-
-  /* DMX driver initialisation: */
-  initDmxDriver_Rcvr();
-
-  /* MIDI Out initialisation: */
-  Serial.print("[INFO] MIDI initialisation...");
-  MidiSerial.begin(31250, SERIAL_8N1, OUT_MIDI_RX, OUT_MIDI_TX);
-  if ( !MidiSerial ) {
-    Serial.println("[ERROR] Could not open MIDI UART.");
-    setErrorcodeBit(ERRBIT_MIDI, true);
-  } else
-    Serial.println(" OK.");
-
-  delay(500);
-  /* LED & Display Test: */
-  char *welcome = SCROLLTEXT_MODELNAME;
-  Disp1.setScrolltext(welcome, true);
-  while ( Disp1.shiftTextByOne() )
-    delay(120);
-  Disp1.clear();
-
-  Serial.println("[INFO] Initialisations finished.\n");
-  delay(500);
-  /* LED Test off: */
-  ledcWrite(PWMCH_LED_ACTY, 0x0);
-  ledcWrite(PWMCH_LED_ERR, 0x0);
-
-  /* Write initial DMX packet */
-  for ( short b = 1; b <= 512; b++ )
-    dmx_write_slot(DMXDRVR_PORT, b, 0x00);
-
-  resetDispTimestamps();
-  wait_after_setup += millis();
-} /* setup */
-
 void loop() {
 
-  /* Taster abfragen: */
-  bool bttg = false;
-  for ( menubtn_t tstr : IN_MENUBTNS ) {
-    bttg = bitRead(menubtnsPressed, tstr.bit);
-    if ( (millis() - ts_lastBtnEvent >= DUR_BTN_HYST) && !bttg && digitalRead(tstr.pin) == HIGH ) {
-      /* Pos Flanke = Taster Betaetigung, entprellt um DUR_BTN_HYST */
-      ts_lastBtnEvent = millis();
-      bitSet(menubtnsPressed, tstr.bit);
-    } else if ( (millis() - ts_lastBtnEvent >= DUR_BTN_HYST) && bttg && digitalRead(tstr.pin) == LOW ) {
-      /* Neg Flanke = Taster Freigabe, entprellt um DUR_BTN_HYST */
-      bitClear(menubtnsPressed, tstr.bit);
-      if ( millis() - ts_lastBtnEvent < DUR_BTN_HOLD ) OnMenuBtnPress(menubtnsPressed, tstr.bit);
-    } else if ( bttg && digitalRead(tstr.pin) == HIGH && (millis() - ts_lastBtnEvent >= DUR_BTN_HOLD) ) {
-      /* Taster wird gehalten? */
-      if ( millis() - ts_lastBtnEvent < DUR_BTN_HOLD + DUR_BTN_HYST )
-        OnMenuBtnPressLong(menubtnsPressed, tstr.bit);
-      else if ( millis() - ts_btnHolding >= TICK_BTN_HOLD )
-        OnMenuBtnHold(menubtnsPressed, tstr.bit);
+    /* Taster abfragen: */
+    bool bttg = false;
+    for ( menubtn_t tstr : IN_MENUBTNS ) {
+        switch ( menubtn_states[tstr.bit] ) {
+        case MENUBTN_STATE_PRESSED:
+            MenuBtnPress(menubtnsPressed, tstr.bit) menubtn_states[tstr.bit] = MENUBTN_STATE_NONE;
+            break;
+        case MENUBTN_STATE_HOLD:
+            if ( millis() - ts_btnHolding >= TICK_BTN_HOLD ) MenuBtnHold(menubtnsPressed, tstr.bit);
+            break;
+        default:
+            break;
+        }
     }
-  }
 
-  /* Sending DMX respecting packet duration: */
-  if ( millis() - ts_dmxSending >= DMX_TICK_MIN ) {
-    if ( dmx_sendNow || (millis() - ts_dmxSending >= TICK_DMX_HB) ) {
-      sendDmxData();
+    /* Sending DMX respecting packet duration: */
+    if ( millis() - ts_dmxSending >= DMX_TICK_MIN ) {
+        if ( dmx_sendNow || (millis() - ts_dmxSending >= TICK_DMX_HB) ) {
+            sendDmxData();
+        }
     }
-  }
 
-  /* Activity Status LED: */
-  if ( millis() - ts_activity >= TICK_LED_FLASH ) {
-    ledcWrite(PWMCH_LED_ACTY, PWM_DIM);
-  }
-
-  /* Show name for determined time or value instead: */
-  if ( millis() - ts_dispName < DUR_DISP_MNAME ) {
-    if ( showMenuName ) {
-      Disp1.showMenuName();
-      showMenuName = false;
+    /* Activity Status LED: */
+    if ( millis() - ts_activity >= TICK_LED_FLASH ) {
+        ledcWrite(PWMCH_LED_ACTY, PWM_DIM);
     }
-  } else if ( Disp1.isEdit() && (millis() - ts_dispEditBlink >= DUR_DISP_EDIT[disp_editArrow ? 1 : 0]) ) {
-    /* Show blinking arrow in display edit mode. */
-    disp_editArrow = !disp_editArrow;
-    Disp1.showValue(disp_editArrow);
-    ts_dispEditBlink = millis();
-  } else if ( millis() - ts_dispLastValUpdt >= DUR_DISP_UPDT ) {
-    /* Update display. Set sinceLostConnection, where 0 is the reset state. */
-    if ( Disp1.getCurrPrefix() == MENU_PFIX_VRBG )
-      sinceLostConnection = (ts_lostConnection > 0 ? ((millis() - ts_lostConnection) / 1000) : 0);
-    Disp1.showValue(disp_editArrow);
-    xmtr_lastFunBtn = (errorCode == 0 ? DISPVAL_T_NONE : DISPVAL_T_UNKNOWN); /* Clear LastFunBtn */
-    ts_dispLastValUpdt = millis();
-  }
 
-  /* Sending ALIVE heart beat: */
-  if ( millis() - ts_aliveSend >= TICK_ALIVE ) {
-    sofu_pkt_alive_t pkt = {recv_stamp++, false};
-    EspNowSendMsg_SoFu(MAC_PEER, asbytesptr(&pkt), pkt.len);
-    ts_aliveSend = millis();
-  }
+    /* Show name for determined time or value instead: */
+    if ( millis() - ts_dispName < DUR_DISP_MNAME ) {
+        if ( showMenuName ) {
+            Disp1.showMenuName();
+            showMenuName = false;
+        }
+    } else if ( Disp1.isEdit() && (millis() - ts_dispEditBlink >= DUR_DISP_EDIT[disp_editArrow ? 1 : 0]) ) {
+        /* Show blinking arrow in display edit mode. */
+        disp_editArrow = !disp_editArrow;
+        Disp1.showValue(disp_editArrow);
+        ts_dispEditBlink = millis();
+    } else if ( millis() - ts_dispLastValUpdt >= DUR_DISP_UPDT ) {
+        /* Update display. Set sinceLostConnection, where 0 is the reset state. */
+        if ( Disp1.getCurrPrefix() == MENU_PFIX_VRBG )
+            sinceLostConnection = (ts_lostConnection > 0 ? ((millis() - ts_lostConnection) / 1000) : 0);
+        Disp1.showValue(disp_editArrow);
+        xmtr_lastFunBtn = (errorCode == 0 ? DISPVAL_T_NONE : DISPVAL_T_UNKNOWN); /* Clear LastFunBtn */
+        ts_dispLastValUpdt = millis();
+    }
 
-  /* Connection lost (only triggered once on lost connection): */
-  if ( (millis() - ts_activity >= 2 * TICK_ALIVE) && !bitRead(errorCode, ERRBIT_NO_CONN) &&
-       (millis() > wait_after_setup) ) {
-    setErrorcodeBit(ERRBIT_NO_CONN, true);
-    rssiPeer = RSSI_NO_CONN;
-    xmtr_lastFunBtn = DISPVAL_T_UNKNOWN;
-    ts_lostConnection = ts_dispLastValUpdt = millis();
-    if ( millis() > DUR_ERR_LED_CONN ) Disp1.jumpToMenu(MENU_PFIX_VRBG);
-    Serial.println("[WARN] Lost connection to transmitter!");
-  }
+    /* Sending ALIVE heart beat: */
+    if ( millis() - ts_aliveSend >= TICK_ALIVE ) {
+        sofu_pkt_alive_t pkt = {recv_stamp++, false};
+        EspNowSendMsg_SoFu(MAC_PEER, asbytesptr(&pkt), pkt.len);
+        ts_aliveSend = millis();
+    }
 
-  /* Do something with every 4Hz tick: */
-  if ( millis() - ts_tick4hz >= TICK_4HZ ) {
-    ts_tick4hz = millis();
-    /* Error LED: */
-    if ( bitRead(errorCode, ERRBIT_NO_CONN) )
-      ledcWrite(PWMCH_LED_ERR, ledcRead(PWMCH_LED_ERR) == 0 ? PWM_FULL : 0x0); /* Connection now lost */
-    else if ( (millis() - ts_lostConnection < DUR_ERR_LED_CONN) && (millis() > wait_after_setup + DUR_ERR_LED_CONN) )
-      ledcWrite(PWMCH_LED_ERR, PWM_DIM); /* Connection was lost not too long ago */
-    else if ( errorCode > 0 )
-      ledcWrite(PWMCH_LED_ERR, PWM_BRT); /* Other error */
-    else
-      ledcWrite(PWMCH_LED_ERR, 0x0); /* Clear error LED */
-  }
+    /* Connection lost (only triggered once on lost connection): */
+    if ( (millis() - ts_activity >= 2 * TICK_ALIVE) && !bitRead(errorCode, ERRBIT_NO_CONN) &&
+         (millis() > wait_after_setup) ) {
+        setErrorcodeBit(ERRBIT_NO_CONN, true);
+        rssiPeer = RSSI_NO_CONN;
+        xmtr_lastFunBtn = DISPVAL_T_UNKNOWN;
+        ts_lostConnection = ts_dispLastValUpdt = millis();
+        if ( millis() > DUR_ERR_LED_CONN ) Disp1.jumpToMenu(MENU_PFIX_VRBG);
+        Serial.println("[WARN] Lost connection to transmitter!");
+    }
+
+    /* Do something with every 4Hz tick: */
+    if ( millis() - ts_tick4hz >= TICK_4HZ ) {
+        ts_tick4hz = millis();
+        /* Error LED: */
+        if ( bitRead(errorCode, ERRBIT_NO_CONN) )
+            ledcWrite(PWMCH_LED_ERR, ledcRead(PWMCH_LED_ERR) == 0 ? PWM_FULL : 0x0); /* Connection now lost */
+        else if (
+            (millis() - ts_lostConnection < DUR_ERR_LED_CONN) && (millis() > wait_after_setup + DUR_ERR_LED_CONN) )
+            ledcWrite(PWMCH_LED_ERR, PWM_DIM); /* Connection was lost not too long ago */
+        else if ( errorCode > 0 )
+            ledcWrite(PWMCH_LED_ERR, PWM_BRT); /* Other error */
+        else
+            ledcWrite(PWMCH_LED_ERR, 0x0); /* Clear error LED */
+    }
 
 #ifdef DEBUG
-  Serial.printf("![DEBUG] Errorcode: %x \n", errorCode);
+    Serial.printf("![DEBUG] Errorcode: %x \n", errorCode);
 #endif
 } /* loop */
 
 /* DMX-Paket senden. */
 void sendDmxData() {
-  dmx_write_offset(DMXDRVR_PORT, dmxdrvr_address, fun_channels, dmxdrvr_pers.footpr());
-  dmx_send(DMXDRVR_PORT);
-  dmx_sendNow = false;
-  ts_dmxSending = millis();
+    dmx_write_offset(DMXDRVR_PORT, dmxdrvr_address, fun_channels, dmxdrvr_pers.footpr());
+    dmx_send(DMXDRVR_PORT);
+    dmx_sendNow = false;
+    ts_dmxSending = millis();
 }
 
 /*  */
 void sendMidiData(sofu_pkt_funbtn_t pkt) {
-  uint8_t midi_msg[3];
-  midi_msg[0] = 0x90 | ((midi_channel - 1) & 0x0f);           /* Note On, Channel */
-  midi_msg[1] = (midi_firstNoteNo + pkt.lastFunbtnId) & 0x7f; /* Note Number */
-  if ( pkt.lastActn == FUNBTN_ACTION::FUNBTN_BTNDOWN ) {
-    midi_msg[2] = 0x7f; /* Velocity 100% */
-  } else if ( pkt.lastActn == FUNBTN_ACTION::FUNBTN_BTNUP ) {
-    midi_msg[2] = 0x00; /* Velocity 0% */
-  } else
-    return;
-  MidiSerial.write(midi_msg, 3);
+    uint8_t midi_msg[3];
+    midi_msg[0] = 0x90 | ((midi_channel - 1) & 0x0f);           /* Note On, Channel */
+    midi_msg[1] = (midi_firstNoteNo + pkt.lastFunbtnId) & 0x7f; /* Note Number */
+    if ( pkt.lastActn == FUNBTN_ACTION::FUNBTN_BTNDOWN ) {
+        midi_msg[2] = 0x7f; /* Velocity 100% */
+    } else if ( pkt.lastActn == FUNBTN_ACTION::FUNBTN_BTNUP ) {
+        midi_msg[2] = 0x00; /* Velocity 0% */
+    } else
+        return;
+    MidiSerial.write(midi_msg, 3);
 }
 
 /* Setzt den Fehlercode des Empfaengers. */
 void setErrorcodeBit(SOFU_ERRORCODE_BIT fc_bit, bool set) {
-  bitWrite(errorCode, fc_bit, set);
-  bitWrite(errorCode_disp, fc_bit, set);
+    bitWrite(errorCode, fc_bit, set);
+    bitWrite(errorCode_disp, fc_bit, set);
 }
 
 void resetDispTimestamps() {
-  ts_dispName = millis();
-  showMenuName = true;
+    ts_dispName = millis();
+    showMenuName = true;
+}
+
+#pragma endregion
+
+#pragma region "INTERRUPTS"
+
+void ARDUINO_ISR_ATTR OnMenuBtnChange() {
+    for ( menubtn_t tstr : IN_MENUBTNS ) {
+        if ( digitalRead(tstr.pin) == HIGH ) {
+            menubtn_states[tstr.bit] = MENUBTN_STATE_DOWN;
+
+        } else if ( menubtn_states[tstr.bit] == MENUBTN_STATE_DOWN ) {
+            if ( millis() - ts_lastBtnEvent >= DUR_BTN_HYST ) {
+                /* Pos Flanke = Taster Betaetigung, entprellt um DUR_BTN_HYST */
+                if ( millis() - ts_lastBtnEvent >= DUR_BTN_HOLD )
+                    menubtn_states[tstr.bit] = MENUBTN_STATE_HOLD;
+                else
+                    menubtn_states[tstr.bit] = MENUBTN_STATE_PRESSED;
+            }
+        } else {
+            menubtn_states[tstr.bit] = MENUBTN_STATE_NONE;
+        }
+    }
+    ts_lastBtnEvent = millis();
 }
 
 #pragma endregion
@@ -462,160 +515,154 @@ void resetDispTimestamps() {
 #pragma region "CALLBACKS"
 
 /* Callback Taster Druecken. Wird nur EINMALIG aufgerufen wenn Taster KURZ BETAETIGT. */
-void OnMenuBtnPress(uint8_t menubtnsPressed, uint8_t bitBtn) {
-  if ( Disp1.isEdit() ) {
-    if ( (bitBtn == IN_MENUBTNS[MENU_DN].bit) && !bitRead(menubtnsPressed, IN_MENUBTNS[MENU_UP].bit) ) {
-      /* Taster Runter betaetigt */
-      Disp1.valueDn();
-    } else if ( (bitBtn == IN_MENUBTNS[MENU_UP].bit) && !bitRead(menubtnsPressed, IN_MENUBTNS[MENU_DN].bit) ) {
-      /* Taster Hoch betaetigt */
-      Disp1.valueUp();
-    } else if ( bitBtn == IN_MENUBTNS[MENU_OK].bit ) {
-      /* Taste OK: Speichern */
-      /* Anzeige des Text "OK" fuer Anzeigedauer: */
-      Disp1.saveSetting();
-      disp_editArrow = false;
-      ts_dispLastValUpdt = millis();
+void MenuBtnPress(uint8_t menubtnsPressed, uint8_t ixBtn) {
+    if ( Disp1.isEdit() ) {
+        if ( (ixBtn == IN_MENUBTNS[MENU_DN].bit) && !bitRead(menubtnsPressed, IN_MENUBTNS[MENU_UP].bit) ) {
+            /* Taster Runter betaetigt */
+            Disp1.valueDn();
+        } else if ( (ixBtn == IN_MENUBTNS[MENU_UP].bit) && !bitRead(menubtnsPressed, IN_MENUBTNS[MENU_DN].bit) ) {
+            /* Taster Hoch betaetigt */
+            Disp1.valueUp();
+        } else if ( ixBtn == IN_MENUBTNS[MENU_OK].bit ) {
+            /* Taste OK: Speichern */
+            /* Anzeige des Text "OK" fuer Anzeigedauer: */
+            Disp1.saveSetting();
+            disp_editArrow = false;
+            ts_dispLastValUpdt = millis();
+        }
+    } else {
+        /* Anzeigemodus: */
+        if ( ixBtn == IN_MENUBTNS[MENU_DN].bit ) {
+            /* Taster DN kurz betaetigt: Vorheriges Menue */
+            Disp1.prevMenu();
+            resetDispTimestamps();
+        } else if ( ixBtn == IN_MENUBTNS[MENU_UP].bit ) {
+            /* Taster UP kurz betaetigt: Naechstes Menue */
+            Disp1.nextMenu();
+            resetDispTimestamps();
+        } else if ( ixBtn == IN_MENUBTNS[MENU_OK].bit ) {
+            /* Taster OK kurz betaetigt */
+            if ( Disp1.getCurrPrefix() == MENU_PFIX_VRBG ) {
+                if ( !bitRead(errorCode, ERRBIT_NO_CONN) ) {
+                    ts_lostConnection = 0UL; /* Reset lost connection info status */
+                    Disp1.writeChars(" 00 ");
+                } else
+                    Disp1.writeChars("  X ");
+                ts_dispLastValUpdt = millis();
+            } else {
+                Disp1.showMenuName();
+                resetDispTimestamps();
+            }
+        }
     }
-  } else {
-    /* Anzeigemodus: */
-    if ( bitBtn == IN_MENUBTNS[MENU_DN].bit ) {
-      /* Taster DN kurz betaetigt: Vorheriges Menue */
-      Disp1.prevMenu();
-      resetDispTimestamps();
-    } else if ( bitBtn == IN_MENUBTNS[MENU_UP].bit ) {
-      /* Taster UP kurz betaetigt: Naechstes Menue */
-      Disp1.nextMenu();
-      resetDispTimestamps();
-    } else if ( bitBtn == IN_MENUBTNS[MENU_OK].bit ) {
-      /* Taster OK kurz betaetigt */
-      if ( Disp1.getCurrPrefix() == MENU_PFIX_VRBG ) {
-        if ( !bitRead(errorCode, ERRBIT_NO_CONN) ) {
-          ts_lostConnection = 0UL; /* Reset lost connection info status */
-          Disp1.writeChars(" 00 ");
-        } else
-          Disp1.writeChars("  X ");
-        ts_dispLastValUpdt = millis();
-      } else {
-        Disp1.showMenuName();
-        resetDispTimestamps();
-      }
-    }
-  }
-}
-
-/* Callback Taster langes Druecken. Wird WIEDERHOLT aufgerufen wenn Taster LANG BETAETIGT. */
-void OnMenuBtnPressLong(uint8_t menubtnsPressed, uint8_t bitBtn) {
-  // Sicherstellen dass nicht nochmal ausgeloest wird:
-  ts_lastBtnEvent -= DUR_BTN_HYST;
-  if ( bitBtn == IN_MENUBTNS[MENU_OK].bit ) {
-    /* OK gehalten, Einstellmodus wechseln */
-    Disp1.toogleEdit();
-  }
 }
 
 /* Callback Taster Halten. */
-void OnMenuBtnHold(uint8_t menubtnsPressed, uint8_t bitBtn) {
-  if ( Disp1.isEdit() ) {
-    /* Wenn Display im Einstellmodus */
-    if ( (bitBtn == IN_MENUBTNS[MENU_DN].bit) && !bitRead(menubtnsPressed, IN_MENUBTNS[MENU_UP].bit) ) {
-      /* Taster Runter gedrueckt (exklusiv) */
-      Disp1.valueDn(true);
-    } else if ( (bitBtn == IN_MENUBTNS[MENU_UP].bit) && !bitRead(menubtnsPressed, IN_MENUBTNS[MENU_DN].bit) ) {
-      /* Taster Hoch gedrueckt (exklusiv) */
-      Disp1.valueUp(true);
+void MenuBtnHold(uint8_t menubtnsPressed, uint8_t ixBtn) {
+    if ( menubtn_states[MENU_OK] ) {
+        /* OK gehalten, Einstellmodus wechseln */
+        Disp1.toogleEdit();
+        menubtn_states[MENU_OK] = MENUBTN_STATE_NONE; /* Reset state fuer OK. */
+    } else if ( Disp1.isEdit() ) {
+        /* Wenn Display im Einstellmodus */
+        if ( (menubtn_states[MENU_DN]) && (menubtn_states[MENU_UP] == 0) ) {
+            /* Taster Runter exklusiv gedrueckt */
+            Disp1.valueDn(true);
+        } else if ( (menubtn_states[MENU_UP]) && (menubtn_states[MENU_DN] == 0) ) {
+            /* Taster Hoch exklusiv gedrueckt */
+            Disp1.valueUp(true);
+        }
     }
-  }
-  ts_btnHolding = millis();
+    ts_btnHolding = millis();
 }
 
 /* Callback Empfangenes Paket verarbeiten. */
-void OnDataRecv_Rcvr(const uint8_t *mac, const uint8_t *in_data, int data_len) {
-  if ( !sofu_pkt_primiv_t::valides_pkt(in_data, data_len) ) {
-    Serial.println("[INFO] ESP-NOW: Paket mit unbekanntem Format empfangen.");
-    return;
-  }
-  ts_activity = millis();
-  ledcWrite(PWMCH_LED_ACTY, PWM_BRT);
+void DataRecv_Rcvr(const uint8_t *mac, const uint8_t *in_data, int data_len) {
+    if ( !sofu_pkt_primiv_t::valides_pkt(in_data, data_len) ) {
+        Serial.println("[INFO] ESP-NOW: Paket mit unbekanntem Format empfangen.");
+        return;
+    }
+    ts_activity = millis();
+    ledcWrite(PWMCH_LED_ACTY, PWM_BRT);
 
 #if defined DEBUG || defined DEBUG_WIREL
-  for ( short i = 0; i < data_len; i++ )
-    Serial.printf("%hhx\n", in_data[i]);
+    for ( short i = 0; i < data_len; i++ )
+        Serial.printf("%hhx\n", in_data[i]);
 #endif
-  if ( in_data[SOFU_PKT_KEY_END] == PKT_TYPE_ALIVE ) {
-    /* Alive Paket, Verbindung wiederhergestellt: */
-    if ( bitRead(errorCode, ERRBIT_NO_CONN) ) Serial.println("[INFO] Connection reestablished.");
-    setErrorcodeBit(ERRBIT_NO_CONN, false);
-    ts_activity = millis();
-  } else if ( in_data[SOFU_PKT_KEY_END] == PKT_TYPE_FUNBTN ) {
-    /* F-Taster Paket */
-    sofu_pkt_funbtn_t pktbtn = {};
-    memcpy(&pktbtn, in_data, sizeof(sofu_pkt_funbtn_t));
-    /* Betaetigung uint8_t F-Taster auslesen */
-    for ( uint8_t i = 0; i < FUNBTN_ANZ; i++ ) {
-      fun_channels[i] = bitRead(pktbtn.btn_byte, i) ? 0xff : 0x00;
-    }
-    /* Letzten F-Taster auslesen, Index und Betaetigung: */
-    switch ( pktbtn.lastActn ) {
-    case FUNBTN_BTNDOWN:
-      xmtr_lastFunBtn = -(pktbtn.lastFunbtnId + 1);
-      break;
-    case FUNBTN_BTNUP:
-      xmtr_lastFunBtn = (pktbtn.lastFunbtnId + 1);
-      break;
-    case FUNBTN_ACTN_REPEAT:
-      xmtr_lastFunBtn = DISPVAL_T_INFO;
-      break;
-    default:
-      xmtr_lastFunBtn = DISPVAL_T_UNKNOWN;
-    }
-    ts_dispLastValUpdt = millis() - DUR_DISP_UPDT; /* Update now! */
-    dmx_sendNow = true;
-    sendMidiData(pktbtn);
+    if ( in_data[SOFU_PKT_KEY_END] == PKT_TYPE_ALIVE ) {
+        /* Alive Paket, Verbindung wiederhergestellt: */
+        if ( bitRead(errorCode, ERRBIT_NO_CONN) ) Serial.println("[INFO] Connection reestablished.");
+        setErrorcodeBit(ERRBIT_NO_CONN, false);
+        ts_activity = millis();
+    } else if ( in_data[SOFU_PKT_KEY_END] == PKT_TYPE_FUNBTN ) {
+        /* F-Taster Paket */
+        sofu_pkt_funbtn_t pktbtn = {};
+        memcpy(&pktbtn, in_data, sizeof(sofu_pkt_funbtn_t));
+        /* Betaetigung uint8_t F-Taster auslesen */
+        for ( uint8_t i = 0; i < FUNBTN_ANZ; i++ ) {
+            fun_channels[i] = bitRead(pktbtn.btn_byte, i) ? 0xff : 0x00;
+        }
+        /* Letzten F-Taster auslesen, Index und Betaetigung: */
+        switch ( pktbtn.lastActn ) {
+        case FUNBTN_BTNDOWN:
+            xmtr_lastFunBtn = -(pktbtn.lastFunbtnId + 1);
+            break;
+        case FUNBTN_BTNUP:
+            xmtr_lastFunBtn = (pktbtn.lastFunbtnId + 1);
+            break;
+        case FUNBTN_ACTN_REPEAT:
+            xmtr_lastFunBtn = DISPVAL_T_INFO;
+            break;
+        default:
+            xmtr_lastFunBtn = DISPVAL_T_UNKNOWN;
+        }
+        ts_dispLastValUpdt = millis() - DUR_DISP_UPDT; /* Update now! */
+        dmx_sendNow = true;
+        sendMidiData(pktbtn);
 #ifdef DEBUG_WIREL
-    /* Monitor empfangene Taste: */
-    Serial.println(pktbtn.toString());
+        /* Monitor empfangene Taste: */
+        Serial.println(pktbtn.toString());
 #endif
-  }
+    }
 }
 
 /* Callback WiFi Rx Pakete (Signalqualitaet) verarbeiten. */
-void OnPromiscuousRxEspnow_Rcvr(void *buf, wifi_promiscuous_pkt_type_t type) {
-  /* All espnow traffic uses action frames which are a subtype of the mgmnt
-   * frames so filter out everything else. */
-  if ( type != WIFI_PKT_MGMT ) return;
+void PromiscuousRxEspnow_Rcvr(void *buf, wifi_promiscuous_pkt_type_t type) {
+    /* All espnow traffic uses action frames which are a subtype of the mgmnt
+     * frames so filter out everything else. */
+    if ( type != WIFI_PKT_MGMT ) return;
 
-  const wifi_promiscuous_pkt_t *ppkt = (wifi_promiscuous_pkt_t *)buf;
-  const wifi_ieee80211_packet_t *ipkt = (wifi_ieee80211_packet_t *)ppkt->payload;
-  const wifi_ieee80211_mac_hdr_t *hdr = &ipkt->hdr;
+    const wifi_promiscuous_pkt_t *ppkt = (wifi_promiscuous_pkt_t *)buf;
+    const wifi_ieee80211_packet_t *ipkt = (wifi_ieee80211_packet_t *)ppkt->payload;
+    const wifi_ieee80211_mac_hdr_t *hdr = &ipkt->hdr;
 
-  /* Nur weiter verarbeiten wenn Action Frame und passende OUI */
-  if ( (hdr->frame_ctrl & 0xFF) == ACTION_SUBTYPE && memcmp(hdr->addr1, MACOUI_SF, sizeof(MACOUI_SF)) == 0 ) {
-    rssiPeer = ppkt->rx_ctrl.rssi;
+    /* Nur weiter verarbeiten wenn Action Frame und passende OUI */
+    if ( (hdr->frame_ctrl & 0xFF) == ACTION_SUBTYPE && memcmp(hdr->addr1, MACOUI_SF, sizeof(MACOUI_SF)) == 0 ) {
+        rssiPeer = ppkt->rx_ctrl.rssi;
 #if defined DEBUG || defined DEBUG_WIREL
-    Serial.println("![DEBUG] Signal: " + (String)rssiPeer + " " + rssiPeer.prozStr());
+        Serial.println("![DEBUG] Signal: " + (String)rssiPeer + " " + rssiPeer.prozStr());
 #endif
-  }
+    }
 }
 
 /* Callback Display Einstellung bestaetigt */
-bool OnSaveUserSetting_Disp(rcvr_disp_menue_t currMenu) {
-  if ( preferences.begin(PREFS, false) ) {
-    /* Save settings to flash: */
-    preferences.putShort(PREFS_DMX_ADRS, dmxdrvr_address);
-    preferences.putShort(PREFS_PERS_NUM, dmxdrvr_pers_num);
-    preferences.putShort(PREFS_MIDI_CHAN, midi_channel);
-    preferences.putShort(PREFS_MIDI_NOTE, midi_firstNoteNo);
-    preferences.end();
-    /* Choose new personality and set address: */
-    if ( !dmxdrvr_pers.chooseByNum(dmxdrvr_pers_num) ) return false;
-    if ( !dmx_set_current_personality(DMXDRVR_PORT, dmxdrvr_pers.num()) ) return false;
-    if ( !dmx_set_start_address(DMXDRVR_PORT, dmxdrvr_address) ) return false;
-    /* Set new max for address menu: */
-    DISPMENU_ADRS->varMax = (513 - dmxdrvr_pers.footpr());
-    return true;
-  } else
-    return false;
+bool SaveUserSetting_Disp(rcvr_disp_menue_t currMenu) {
+    if ( preferences.begin(PREFS, false) ) {
+        /* Save settings to flash: */
+        preferences.putShort(PREFS_DMX_ADRS, dmxdrvr_address);
+        preferences.putShort(PREFS_PERS_NUM, dmxdrvr_pers_num);
+        preferences.putShort(PREFS_MIDI_CHAN, midi_channel);
+        preferences.putShort(PREFS_MIDI_NOTE, midi_firstNoteNo);
+        preferences.end();
+        /* Choose new personality and set address: */
+        if ( !dmxdrvr_pers.chooseByNum(dmxdrvr_pers_num) ) return false;
+        if ( !dmx_set_current_personality(DMXDRVR_PORT, dmxdrvr_pers.num()) ) return false;
+        if ( !dmx_set_start_address(DMXDRVR_PORT, dmxdrvr_address) ) return false;
+        /* Set new max for address menu: */
+        DISPMENU_ADRS->varMax = (513 - dmxdrvr_pers.footpr());
+        return true;
+    } else
+        return false;
 }
 
 #pragma endregion

@@ -5,9 +5,10 @@
 
 #pragma once
 
-#include <Arduino.h>
-#include <esp_now.h>
+#include <string>
 #include <esp_wifi.h>
+#include <esp_now.h>
+#include <Arduino.h>
 
 using namespace std;
 
@@ -43,7 +44,7 @@ enum PWM_GAMMA22_8B : uint8_t {
   PWM_FULL = 0xff /* => 100% */
 };
 
-/* string length for MAC address. */
+/* std::string length for MAC address. */
 #define MAC_STR_LEN 18
 /* An alle Peer-Teilnehmer senden. */
 #define MAC_PEER_ALL nullptr
@@ -141,10 +142,10 @@ public:
     this->lastFunbtnId = lastFunbtnId;
     this->lastActn = lastActn;
   };
-  String toString() {
+  std::string toString() {
     char strc[35];
     sprintf(strc, "FBTN St:%04u By:%1hhx Id:%2hhx A:%c", stamp, btn_byte, lastFunbtnId, (char)lastActn);
-    String str = (String)strc;
+    std::string str = (std::string)strc;
     return str;
   }
 };
@@ -156,51 +157,45 @@ public:
   /* Definiert ein RssiValue Objekt mit unterer und oberer Grenze.
    * @param p0 Untere dBm-Grenze fuer 0%
    * @param p100 Obere dBm-Grenze fuer 100% */
-  RssiValue(const signed int f, T_rssi *proz_p, const signed int p0, const signed int p100) {
+  RssiValue(const int16_t f, T_rssi *proz_p, const int16_t p0, const int16_t p100) {
     _dbm = f;
     updtVal(f);
     _p0 = p0;
     _p100 = p100;
-    proz = proz_p;
+    proz_p = proz_p;
   }
   virtual ~RssiValue() {
   }
-  virtual signed int &operator=(const signed int &f) {
+  virtual int16_t &operator=(const int16_t &f) {
     updtVal(f);
     return _dbm = f;
   }
-  virtual const signed int &operator()() const {
+  virtual const int16_t &operator()() const {
     return _dbm;
   }
-  virtual bool operator>(const signed int &r) {
+  virtual bool operator>(const int16_t &r) {
     return r < _dbm;
   }
-  virtual bool operator<=(const signed int &r) {
+  virtual bool operator<=(const int16_t &r) {
     return !(r < _dbm);
   }
-  virtual bool operator>=(const signed int &r) {
+  virtual bool operator>=(const int16_t &r) {
     return !(_dbm < r);
-  }
-  virtual operator String() const {
-    return (String)_dbm + "dBm";
-  }
-  String prozStr() const {
-    return (String)*proz + "%";
   }
   /* Darstellung des RSSI in Prozent (Min dBm = 0%, Max dBm = 100%). */
 private:
-  signed int _dbm;
+  int16_t _dbm;
   int _p0 = -93;
   int _p100 = -50;
-  T_rssi *proz;
-  void updtVal(signed int f) {
-    if ( proz != nullptr ) {
+  T_rssi *proz_p;
+  void updtVal(int16_t f) {
+    if ( proz_p != nullptr ) {
       if ( f <= _p0 )
-        *proz = 0;
+        *proz_p = 0;
       else if ( f >= _p100 )
-        *proz = 100;
+        *proz_p = 100;
       else
-        *proz = map(f, _p0 + 1, _p100, 1, 100);
+        *proz_p = map(f, _p0 + 1, _p100, 1, 100);
     }
   }
 };
@@ -227,14 +222,11 @@ char bittochr(unsigned char by, unsigned short pos);
 /* Output des Pins wird gewechselt. */
 void digitalToggle(uint8_t pin);
 
-/* Konvertiert eine MAC Adresse von Byte Array zu String. */
-String macAddrToStr(const uint8_t *mac);
-
-/* Gibt die MAC Adresse des ESP32 als String zurueck. */
-String getMacAddrStr_esp();
+/* Ruft die MAC Adresse des ESP32 ab und speichert sie in den uebergebenen String. */
+void getMacAddrStr_esp(char *macStr);
 
 /* Sendet eine ESP-NOW Nachricht an spezifische MAC. */
-void EspNowSendMsg_SoFu(const uint8_t peer_mac[6], const uint8_t *data, size_t data_len);
+void EspNowSendMsg_SoFu(const uint8_t peer_mac[6], const uint8_t *data, size_t data_len) ;
 
 /* Standard Callback NOW Paket empfangen. */
 void OnNowPktRecv_SoFu(const uint8_t *nowpkg, int len);

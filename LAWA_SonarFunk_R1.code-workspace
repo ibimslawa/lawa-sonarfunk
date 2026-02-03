@@ -8,6 +8,9 @@
 		},
 		{
 			"path": "SonarFunk_R1_XTMR"
+		},
+		{
+			"path": "esp_preferences"
 		}
 	],
 	"settings": {

@@ -1,7 +1,7 @@
 {
-    "name": "LAWA Sonar+Funk R1 Project Lib",
-    "version": "1.5.0",
-    "description": "Shared code for the LAWA Sonar+Funk R1 project",
+    "name": "LAWA Sonar+Funk Project Lib",
+    "version": "2.0.0",
+    "description": "Shared code for the LAWA Sonar+Funk project",
     "authors":
     [
       {
